@@ -1,0 +1,6 @@
+.vs/
+*.dll
+*.obj
+*.pdb
+__pycache__/
+*.pyc
