@@ -3,12 +3,14 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>						//para usar funções matemáticas como sin, cos
 #include "interface.h"
 #include "filesystem.h"
 #include "engine/iserverplugin.h"		//define a forma como o plugin vai se comunicar com a engine	
 #include "eiface.h"						//tem as funções gerais do servidor
 #include "convar.h"						//permite criar comandos e variáveis de consola
 #include "engine/IEngineTrace.h"		//ajuda a criar colisões e traços (olhos da mosca)
+#include "engine/ivdebugoverlay.h"		//permite desenhar linhas no ecrã, para vermos os raios no jogo
 #include "tier2/tier2.h"
 #include "game/server/iplayerinfo.h"	//toda a informação sobre os jogadores e bots
 
@@ -28,6 +30,7 @@ IBotManager* botmanager = NULL;					//Serve para criar bots
 IServerPluginHelpers* helpers = NULL;			//Para enviar comandos em nome do bot
 IEngineTrace* enginetrace = NULL;				//para as colisoes e traços (olhos da mosca)
 CGlobalVars* gpGlobals = NULL;					//para saber o tempo, o número de jogadores...
+IVDebugOverlay* debugoverlay = NULL;			//para desenhar linhas no ecrã, para vermos os raios no jogo
 
 //Estado do Bot
 /*
@@ -36,10 +39,23 @@ CGlobalVars* gpGlobals = NULL;					//para saber o tempo, o número de jogadores.
 
 */
 static edict_t* g_pBotEdict = NULL;							//é a ficha "técnica" do bot
-static IBotController* g_pBot = NULL;						//ficha do bot, para saber se ele está vivo, se está a jogar...
-static IPlayerInfo* g_pBotInfo = NULL;
-static float           g_flYaw = 0.0f;						//para saber para onde o bot está a olhar em graus
-static float           g_flProximaTentativaEquipa = 0.0f;
+static IBotController* g_pBot = NULL;						
+static IPlayerInfo* g_pBotInfo = NULL;						//ficha do bot, para saber se ele está vivo, se está a jogar...
+static float g_flYaw = 0.0f;						        //para saber para onde o bot está a olhar em graus
+static float g_flProximaTentativaEquipa = 0.0f;
+
+/*
+	7 raios espalhados por 120º, cada um com um alcance de 500 unidades (cerca de 9,5m)
+	Saem a 40 unidades de altura, à cintura, para detetarem também caixas baixas e não so paredes.
+  */
+
+const int NUM_RAIOS = 7;									//quantos raios vamos disparar para ver se há paredes à frente do bot
+const float ANGULO_ABERTURA = 120.0f;						//qual é o ângulo de abertura dos raios, em graus
+const float ALCANCE_RAIO = 500.0f;							//qual é o alcance dos raios, em unidades do jogo
+const float ALTURA_OLHOS = 40.0f;
+
+static float g_flDistancias[NUM_RAIOS];						//este array vai guardar a distancia de cada raio 
+static float g_flProximoPrint = 0.0f;
 
 static void LimparBot()										//esquece o bot quando ele desaparece, para nunca usarmos 
 //um ponteiro para algo que já não existe(isso crasharia o jogo).
@@ -53,8 +69,9 @@ static void LimparBot()										//esquece o bot quando ele desaparece, para nun
 /*Uma ConVar é uma variável de consola que pode ser alterada sem recompilar o jogo*/
 
 //Os argumentos são: nome da variável, valor por defeito, flags (0 = normal), descrição (útil para testar)
-ConVar mosca_velocidade("mosca_velocidade", "150", 0, "Velocidade para a frente do bot (0 a 250)");
-ConVar mosca_rotacao("mosca_rotacao", "1.5", 0, "Graus que o bot roda em cada tick");
+ConVar mosca_velocidade("mosca_velocidade", "150", 0, "Velocidade para a frente do bot (0 a 250)");			
+ConVar mosca_rotacao("mosca_rotacao", "5", 0, "Graus que o bot roda em cada tick");						//maximo que e preciso rodar para desviar
+ConVar mosca_debug("mosca_debug", "1", 0, "1 = desenha os raios e mostra as distancias na consola");	//liga e desliga os desenhos dos raios
 
 //Comando para criar o bot
 /*
@@ -121,6 +138,78 @@ void MoscaRemover_f()
 }
 ConCommand cc_mosca_remover("mosca_remover", MoscaRemover_f, "Remove o bot Mosca");
 
+/*
+	Calculamos a posição dos olhos do bot, a posição do bot e a subida 40 unidades.
+
+	Para cada raio, calculamos o desvio do angulo, o raio 0 fica a -60º (direita), o 3 fica a 0º (frente) e o 6 fica a +60º (esquerda).
+	(No CS:S os angulos positivos vao para a esquerda e os negativos para a direita)
+
+	Convertemos para radianos e calculamos o ponto final do raio com trignometria: X = cos(angulo) * alcance, Y = sin(angulo) * alcance
+
+	TraceRay é o raycast: o motor percorre a linha e diz onde bateu. O filtro faz o raio ignorar jogadores e só ver paredes e objetos.
+
+	O fraction vai de 0 (bateu) 1 (não bateu), multiplicamos pelo alcance para saber a distância real do raio.
+
+	Com o debug ligado, desenhamos o raio: verde se está livre, vermelho se há parede perto.
+*/
+
+static void MoscaVer() {
+	Vector origem = g_pBot->GetLocalOrigin();
+	Vector olhos(origem.x, origem.y, origem.z + ALTURA_OLHOS);
+
+	for (int i = 0; i < NUM_RAIOS; i++) {
+		float desvio = -ANGULO_ABERTURA / 2.0f + i * (ANGULO_ABERTURA / (NUM_RAIOS - 1));
+		float anguloRad = (g_flYaw + desvio) * (3.14159265f / 180.0f);
+
+		Vector fim( olhos.x + cosf( anguloRad ) * ALCANCE_RAIO,
+					olhos.y + sinf(anguloRad) * ALCANCE_RAIO,
+					olhos.z);
+
+		Ray_t raio;
+		raio.Init(olhos, fim);
+		CTraceFilterWorldAndPropsOnly filtro;
+		trace_t resultado;
+		enginetrace->TraceRay(raio, MASK_PLAYERSOLID, &filtro, &resultado);
+
+		g_flDistancias[i] = resultado.fraction * ALCANCE_RAIO;
+
+		if (mosca_debug.GetBool() && debugoverlay) {
+			int vermelho = (int)(255 * (1.0f - resultado.fraction));
+			int verde = (int)(255 * resultado.fraction);
+			debugoverlay->AddLineOverlay(olhos, resultado.endpos, vermelho, verde, 0, true, 0.05f);
+		}
+	}
+}
+
+/*
+	Faz a média dos 3 raios da direita e dos 3 da esquerda, olha para o do meio, e aplica três regras: 
+	vira para o lado com mais espaço, vira com força se tem parede mesmo à frente (menos de 80 unidades), 
+	e abranda quando há parede à frente. Na defesa, isto chama-se um veículo de Braitenberg
+*/
+
+static void MoscaDecidir(float& rotacao, float& velocidade) {
+	int metade = NUM_RAIOS / 2;
+
+	float direita = 0.0f;
+	for (int i = 0; i < metade; i++) 
+		direita += g_flDistancias[i];
+	direita /= metade;
+
+	float esquerda = 0.0f;
+	for (int i = metade + 1; i < NUM_RAIOS; i++)
+		esquerda += g_flDistancias[i];
+	esquerda /= metade;
+
+	float frente = g_flDistancias[metade];
+
+	rotacao = mosca_rotacao.GetFloat() * (esquerda - direita) / ALCANCE_RAIO;
+
+	if (frente < 80.0f)
+		rotacao += (esquerda >= direita) ? mosca_rotacao.GetFloat() : -mosca_rotacao.GetFloat();
+
+	velocidade = mosca_velocidade.GetFloat() * (frente / ALCANCE_RAIO);
+}
+
 //Tick
 /*
 	Um servidor de cs:source funciona por ticks, ou seja, este atualiza o mundo 66 vezes por segundo
@@ -131,8 +220,8 @@ ConCommand cc_mosca_remover("mosca_remover", MoscaRemover_f, "Remove o bot Mosca
 								 Verificamos isto uma vez por segundo, para não sobrecarregar o servidor com comandos de equipa.
 
 		- Mexe o bot: O CBotCmd é equivalente ao teclado e rato do bot naquele tick, fowardmove é igual a carregar no W e
-					  viewangles é para onde o rato aponta. O yaw é o ângulo horizontal (soma-se um pouco a cada tick para o bot andar em
-					  circulos). E o runPlayerMove entrega estes comandos à engine
+					  viewangles é para onde o rato aponta. O yaw é o ângulo horizontal (o yaw muda conforme a rotação calculada
+					  pelo MoscaDecidir). E o runPlayerMove entrega estes comandos à engine
 
 */
 static void MoscaTick()
@@ -156,13 +245,31 @@ static void MoscaTick()
 	CBotCmd cmd;
 	memset(&cmd, 0, sizeof(cmd));
 
+	/*
+	
+	O ciclo completo: sentir (raios), decidir (rotação e velocidade), agir (aplicar ao bot). 
+	Duas vezes por segundo, escreve as 7 distâncias na consola, da esquerda para a direita.
+
+	*/
+
 	if (!g_pBotInfo->IsDead())
 	{
-		g_flYaw += mosca_rotacao.GetFloat();
-		if (g_flYaw > 180.0f)  g_flYaw -= 360.0f;
-		if (g_flYaw < -180.0f) g_flYaw += 360.0f;
+		MoscaVer();
 
-		cmd.forwardmove = mosca_velocidade.GetFloat();
+		float rotacao, velocidade;
+		MoscaDecidir(rotacao, velocidade);
+
+		g_flYaw += rotacao;
+		if (g_flYaw > 180.0f) g_flYaw -= 360.0f;
+		if (g_flYaw < -180.0f) g_flYaw += 360.0f;
+		cmd.forwardmove = velocidade;
+
+		if (mosca_debug.GetBool() && gpGlobals->curtime >= g_flProximoPrint) {
+			Msg("[Mosca] Esq %4.0f %4.0f %4.0f | %4.0f | %4.0f %4.0f %4.0f Dir  rot %5.2f  vel %5.1f\n",
+				g_flDistancias[6], g_flDistancias[5], g_flDistancias[4], g_flDistancias[3],
+				g_flDistancias[2], g_flDistancias[1], g_flDistancias[0], rotacao, velocidade);
+			g_flProximoPrint = gpGlobals->curtime + 0.5f;
+		}
 	}
 
 	cmd.viewangles = QAngle(0.0f, g_flYaw, 0.0f);
@@ -181,7 +288,7 @@ static void MoscaTick()
 	Os que usamos normalmente são:
 		GameFrame; MoscaTick; LevelShutdown; ClientDisconnect;
 
-	A ultima linha é o que faz o código ser reconhecido como um plugin pela engine. (Exporta o código como DDL)
+	A ultima linha é o que faz o código ser reconhecido como um plugin pela engine. (Exporta o código como DLL)
 
 */
 class CMoscaPlugin : public IServerPluginCallbacks
@@ -191,7 +298,7 @@ public:
 	virtual void Unload(void);
 	virtual void Pause(void) {}
 	virtual void UnPause(void) {}
-	virtual const char* GetPluginDescription(void) { return "SimuladorPap - Mosca v0.1"; }
+	virtual const char* GetPluginDescription(void) { return "SimuladorPap - Mosca v0.2"; }
 	virtual void LevelInit(char const* pMapName) {}
 	virtual void ServerActivate(edict_t* pEdictList, int edictCount, int clientMax) {}
 	virtual void GameFrame(bool simulating) { if (simulating) MoscaTick(); }
@@ -236,6 +343,7 @@ bool CMoscaPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn ga
 	enginetrace = (IEngineTrace*)interfaceFactory(INTERFACEVERSION_ENGINETRACE_SERVER, NULL);
 	playerinfomanager = (IPlayerInfoManager*)gameServerFactory(INTERFACEVERSION_PLAYERINFOMANAGER, NULL);
 	botmanager = (IBotManager*)gameServerFactory(INTERFACEVERSION_PLAYERBOTMANAGER, NULL);
+	debugoverlay = (IVDebugOverlay*)interfaceFactory(VDEBUG_OVERLAY_INTERFACE_VERSION, NULL);
 
 	Msg("[Mosca] ---- A carregar o plugin ----\n");
 	Msg("[Mosca] engine:            %s\n", engine ? "OK" : "FALHOU");
@@ -243,8 +351,9 @@ bool CMoscaPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn ga
 	Msg("[Mosca] enginetrace:       %s\n", enginetrace ? "OK" : "FALHOU");
 	Msg("[Mosca] playerinfomanager: %s\n", playerinfomanager ? "OK" : "FALHOU");
 	Msg("[Mosca] botmanager:        %s\n", botmanager ? "OK" : "FALHOU");
+	Msg("[Mosca] debugoverlay:      %s\n", debugoverlay ? "OK" : "FALHOU (nao se ve os raios)");
 
-	if (!engine || !helpers || !playerinfomanager || !botmanager)
+	if (!engine || !helpers || !enginetrace || !playerinfomanager || !botmanager)
 	{
 		Warning("[Mosca] Falta uma interface essencial, o plugin nao vai carregar.\n");
 		return false;
