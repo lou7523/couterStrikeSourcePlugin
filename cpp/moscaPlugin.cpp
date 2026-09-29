@@ -52,7 +52,9 @@ static float g_flProximaTentativaEquipa = 0.0f;
 const int NUM_RAIOS = 7;									//quantos raios vamos disparar para ver se há paredes à frente do bot
 const float ANGULO_ABERTURA = 120.0f;						//qual é o ângulo de abertura dos raios, em graus
 const float ALCANCE_RAIO = 500.0f;							//qual é o alcance dos raios, em unidades do jogo
-const float ALTURA_OLHOS = 40.0f;
+const float ALTURA_DEGRAU = 18.0f;							//o bot já consegue subir degraus sozinho ate 18 unidade
+const float AVANCO_MINIMO = 10.0f;							//se depois de subir avanca menos que isto, e uma parede
+const int MAX_SUBIDAS = 24;									//quantos degraus um raio pode subir no maximo
 
 static float g_flDistancias[NUM_RAIOS];						//este array vai guardar a distancia de cada raio 
 static float g_flProximoPrint = 0.0f;
@@ -153,34 +155,81 @@ ConCommand cc_mosca_remover("mosca_remover", MoscaRemover_f, "Remove o bot Mosca
 	Com o debug ligado, desenhamos o raio: verde se está livre, vermelho se há parede perto.
 */
 
+static float MedirRaio(const Vector& pes, float anguloRad) {
+	float dx = cosf(anguloRad);
+	float dy = sinf(anguloRad);
+
+	Vector pos(pes.x, pes.y, pes.z + ALTURA_DEGRAU);
+	float percorrido = 0.0f;
+	bool livre = false;
+
+	Vector segInicio[MAX_SUBIDAS];
+	Vector segFim[MAX_SUBIDAS];
+	int numSeg = 0;
+
+	int s;
+	for (s = 0; s < MAX_SUBIDAS; s++) {
+		float resta = ALCANCE_RAIO - percorrido;
+		Vector fim(pos.x + dx * resta, pos.y + dy * resta, pos.z);
+
+		Ray_t raio;
+		raio.Init(pos, fim);
+		CTraceFilterWorldAndPropsOnly filtro;
+		trace_t tr;
+		enginetrace->TraceRay(raio, MASK_PLAYERSOLID, &filtro, &tr);
+
+		if (tr.startsolid)
+			break;
+
+		segInicio[numSeg] = pos;
+		segFim[numSeg] = tr.endpos;
+		numSeg++;
+
+		float avanco = tr.fraction * resta;
+		percorrido += avanco;
+
+		if (tr.fraction >= 1.0f) {
+			livre = true;
+			break;
+		}
+
+		if (s > 0 && avanco < AVANCO_MINIMO)
+			break;
+
+		pos = Vector(tr.endpos.x - dx, tr.endpos.y - dy, tr.endpos.z + ALTURA_DEGRAU);
+		percorrido -= 1.0f;
+    }
+	
+	if (s == MAX_SUBIDAS)
+		livre = true;
+
+	if (percorrido < 0.0f)
+		percorrido = 0.0f;
+
+	float distancia = livre ? ALCANCE_RAIO : percorrido;
+
+	if (mosca_debug.GetBool() && debugoverlay) {
+		float fracao = distancia / ALCANCE_RAIO;
+		int vermelho = (int)(255 * (1.0f - fracao));
+		int verde = (int)(255 * fracao);
+		for (int k = 0; k < numSeg; k++)
+			debugoverlay->AddLineOverlay(segInicio[k], segFim[k], vermelho, verde, 0, true, 0.05f);
+
+	}
+
+	return distancia;
+}
+
 static void MoscaVer() {
-	Vector origem = g_pBot->GetLocalOrigin();
-	Vector olhos(origem.x, origem.y, origem.z + ALTURA_OLHOS);
+	Vector pes = g_pBot->GetLocalOrigin();
 
 	for (int i = 0; i < NUM_RAIOS; i++) {
 		float desvio = -ANGULO_ABERTURA / 2.0f + i * (ANGULO_ABERTURA / (NUM_RAIOS - 1));
-		float anguloRad = (g_flYaw + desvio) * (3.14159265f / 180.0f);
+		float anguloRad = (g_flYaw + desvio) * 3.14159265f / 180.0f;
 
-		Vector fim( olhos.x + cosf( anguloRad ) * ALCANCE_RAIO,
-					olhos.y + sinf(anguloRad) * ALCANCE_RAIO,
-					olhos.z);
-
-		Ray_t raio;
-		raio.Init(olhos, fim);
-		CTraceFilterWorldAndPropsOnly filtro;
-		trace_t resultado;
-		enginetrace->TraceRay(raio, MASK_PLAYERSOLID, &filtro, &resultado);
-
-		g_flDistancias[i] = resultado.fraction * ALCANCE_RAIO;
-
-		if (mosca_debug.GetBool() && debugoverlay) {
-			int vermelho = (int)(255 * (1.0f - resultado.fraction));
-			int verde = (int)(255 * resultado.fraction);
-			debugoverlay->AddLineOverlay(olhos, resultado.endpos, vermelho, verde, 0, true, 0.05f);
-		}
+		g_flDistancias[i] = MedirRaio(pes, anguloRad);
 	}
 }
-
 /*
 	Faz a média dos 3 raios da direita e dos 3 da esquerda, olha para o do meio, e aplica três regras: 
 	vira para o lado com mais espaço, vira com força se tem parede mesmo à frente (menos de 80 unidades), 
