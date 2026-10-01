@@ -14,6 +14,7 @@
 #include "tier2/tier2.h"
 #include "game/server/iplayerinfo.h"	//toda a informação sobre os jogadores e bots
 
+#include "in_buttons.h"					//esta biblioteca tem todas as teclas que um jogador pode pressionar
 #include "tier0/memdbgon.h"				//tem de ser sempre o último include, 
 										//porque troca o sistema de memória pelo do motor.
 
@@ -23,7 +24,7 @@
 	Aqui vamos criar vários ponteiros NULL para cada menu, e mais para a frente no Load, vamos pedir à engine para nos dar a ferramenta que queremos,
 	e vamos guardar o ponteiro dela na variável correspondente.
 */
- 
+
 IVEngineServer* engine = NULL;
 IPlayerInfoManager* playerinfomanager = NULL;
 IBotManager* botmanager = NULL;					//Serve para criar bots
@@ -39,7 +40,7 @@ IVDebugOverlay* debugoverlay = NULL;			//para desenhar linhas no ecrã, para ver
 
 */
 static edict_t* g_pBotEdict = NULL;							//é a ficha "técnica" do bot
-static IBotController* g_pBot = NULL;						
+static IBotController* g_pBot = NULL;
 static IPlayerInfo* g_pBotInfo = NULL;						//ficha do bot, para saber se ele está vivo, se está a jogar...
 static float g_flYaw = 0.0f;						        //para saber para onde o bot está a olhar em graus
 static float g_flProximaTentativaEquipa = 0.0f;
@@ -53,11 +54,14 @@ const int NUM_RAIOS = 7;									//quantos raios vamos disparar para ver se há 
 const float ANGULO_ABERTURA = 120.0f;						//qual é o ângulo de abertura dos raios, em graus
 const float ALCANCE_RAIO = 500.0f;							//qual é o alcance dos raios, em unidades do jogo
 const float ALTURA_DEGRAU = 18.0f;							//o bot já consegue subir degraus sozinho ate 18 unidade
-const float AVANCO_MINIMO = 10.0f;							//se depois de subir avanca menos que isto, e uma parede
+const float ALTURA_SALTO = 40.0f;							//altura que o bot vai subir para ver se consegue passar por cima da parede
+const float DIST_SALTAR = 48.0f;							//distancia do obstaculo para o bot saltar, se estiver mais perto que isto, ele vai saltar
 const int MAX_SUBIDAS = 24;									//quantos degraus um raio pode subir no maximo
 
 static float g_flDistancias[NUM_RAIOS];						//este array vai guardar a distancia de cada raio 
+static bool g_bSaltouUltimoTick = false;				    //para saber se o bot saltou no tick anterior, para não saltar de novo		
 static float g_flProximoPrint = 0.0f;
+static float g_flDistSalto[NUM_RAIOS];
 
 static void LimparBot()										//esquece o bot quando ele desaparece, para nunca usarmos 
 //um ponteiro para algo que já não existe(isso crasharia o jogo).
@@ -71,7 +75,7 @@ static void LimparBot()										//esquece o bot quando ele desaparece, para nun
 /*Uma ConVar é uma variável de consola que pode ser alterada sem recompilar o jogo*/
 
 //Os argumentos são: nome da variável, valor por defeito, flags (0 = normal), descrição (útil para testar)
-ConVar mosca_velocidade("mosca_velocidade", "150", 0, "Velocidade para a frente do bot (0 a 250)");			
+ConVar mosca_velocidade("mosca_velocidade", "150", 0, "Velocidade para a frente do bot (0 a 250)");
 ConVar mosca_rotacao("mosca_rotacao", "5", 0, "Graus que o bot roda em cada tick");						//maximo que e preciso rodar para desviar
 ConVar mosca_debug("mosca_debug", "1", 0, "1 = desenha os raios e mostra as distancias na consola");	//liga e desliga os desenhos dos raios
 
@@ -140,6 +144,35 @@ void MoscaRemover_f()
 }
 ConCommand cc_mosca_remover("mosca_remover", MoscaRemover_f, "Remove o bot Mosca");
 
+//Vai criar um raio vertical para cima e para baixo, num ponto do mapa e diz a que altura bateu
+/*
+	Os parametros x, y e para marcar a cordena 2d no mapa e o z e para ver se vai para cima ou para baixo
+
+	raio init, cria um raio entre dois pontos. neste raio so muda o z
+
+	filtro e traceRay sao exatamente os mesmos que se usa nos raios horizontais. O filtro ignora os jogadores e so ve as paredes e objetos,
+	o traceray faz raio e guarda o resultado em tr.
+
+	solido = tr.startsolid é o verdade se o ponto de partida do raio já estava dentro de alguma cena. Na pratica significa que o objeto e alto
+	demais por isso deteta como se fosse parede
+
+	bool &solido a funcao escreve lá dentro e quem a chamou recebe o valor. É a forma de uma função devolver duas coisas de uma vez
+	a altura pelo return e se comecou dentro de algo recebe solido.
+
+	endpos e onde o raio parou, e o.z é a altura desse ponto. Se o raio não bater em nada, para no fim devolver zBaixo
+*/
+
+static float AlturaDoChao(float x, float y, float zCima, float zBaixo, bool& solido) {
+	Ray_t raio;
+	raio.Init(Vector(x, y, zCima), Vector(x, y, zBaixo));
+	CTraceFilterWorldAndPropsOnly filtro;
+	trace_t tr;
+	enginetrace->TraceRay(raio, MASK_PLAYERSOLID, &filtro, &tr);
+
+	solido = tr.startsolid;
+	return tr.endpos.z;
+}
+
 /*
 	Calculamos a posição dos olhos do bot, a posição do bot e a subida 40 unidades.
 
@@ -155,13 +188,15 @@ ConCommand cc_mosca_remover("mosca_remover", MoscaRemover_f, "Remove o bot Mosca
 	Com o debug ligado, desenhamos o raio: verde se está livre, vermelho se há parede perto.
 */
 
-static float MedirRaio(const Vector& pes, float anguloRad) {
+static float MedirRaio(const Vector& pes, float anguloRad, float& distSalto) {
 	float dx = cosf(anguloRad);
 	float dy = sinf(anguloRad);
 
-	Vector pos(pes.x, pes.y, pes.z + ALTURA_DEGRAU);
+	float chaoZ = pes.z;
+	Vector pos(pes.x, pes.y, chaoZ + ALTURA_DEGRAU);
 	float percorrido = 0.0f;
 	bool livre = false;
+	distSalto = ALCANCE_RAIO;
 
 	Vector segInicio[MAX_SUBIDAS];
 	Vector segFim[MAX_SUBIDAS];
@@ -185,21 +220,37 @@ static float MedirRaio(const Vector& pes, float anguloRad) {
 		segFim[numSeg] = tr.endpos;
 		numSeg++;
 
-		float avanco = tr.fraction * resta;
-		percorrido += avanco;
+		percorrido += tr.fraction * resta;
 
 		if (tr.fraction >= 1.0f) {
 			livre = true;
 			break;
 		}
 
-		if (s > 0 && avanco < AVANCO_MINIMO)
+		Vector h = tr.endpos;
+		bool solido;
+
+		float antes = AlturaDoChao(h.x - dx * 4.0f, h.y - dy * 4.0f, h.z, chaoZ - 64.0f, solido);
+		float topo = AlturaDoChao(h.x + dx * 8.0f, h.y + dy * 8.0f, antes + ALTURA_SALTO + 1.0f, antes, solido);
+		if (solido)
+			break;
+		float subida = topo - antes;
+
+		if (subida < 0.5f)
 			break;
 
-		pos = Vector(tr.endpos.x - dx, tr.endpos.y - dy, tr.endpos.z + ALTURA_DEGRAU);
+		if (subida > ALTURA_SALTO)
+			break;
+
+		if (subida > ALTURA_DEGRAU && percorrido < distSalto)
+			distSalto = percorrido;
+
+		chaoZ = topo;
+		pos = Vector(h.x - dx, h.y - dy, chaoZ + ALTURA_DEGRAU);
 		percorrido -= 1.0f;
-    }
-	
+
+	}
+
 	if (s == MAX_SUBIDAS)
 		livre = true;
 
@@ -212,12 +263,14 @@ static float MedirRaio(const Vector& pes, float anguloRad) {
 		float fracao = distancia / ALCANCE_RAIO;
 		int vermelho = (int)(255 * (1.0f - fracao));
 		int verde = (int)(255 * fracao);
+		if (distSalto < ALCANCE_RAIO)
+			vermelho = 255;
 		for (int k = 0; k < numSeg; k++)
 			debugoverlay->AddLineOverlay(segInicio[k], segFim[k], vermelho, verde, 0, true, 0.05f);
-
 	}
 
 	return distancia;
+
 }
 
 static void MoscaVer() {
@@ -227,20 +280,21 @@ static void MoscaVer() {
 		float desvio = -ANGULO_ABERTURA / 2.0f + i * (ANGULO_ABERTURA / (NUM_RAIOS - 1));
 		float anguloRad = (g_flYaw + desvio) * 3.14159265f / 180.0f;
 
-		g_flDistancias[i] = MedirRaio(pes, anguloRad);
+		g_flDistancias[i] = MedirRaio(pes, anguloRad, g_flDistSalto[i]);
 	}
 }
+//Como funciona a decisão do bot
 /*
-	Faz a média dos 3 raios da direita e dos 3 da esquerda, olha para o do meio, e aplica três regras: 
-	vira para o lado com mais espaço, vira com força se tem parede mesmo à frente (menos de 80 unidades), 
+	Faz a média dos 3 raios da direita e dos 3 da esquerda, olha para o do meio, e aplica três regras:
+	vira para o lado com mais espaço, vira com força se tem parede mesmo à frente (menos de 80 unidades),
 	e abranda quando há parede à frente. Na defesa, isto chama-se um veículo de Braitenberg
 */
 
-static void MoscaDecidir(float& rotacao, float& velocidade) {
+static void MoscaDecidir(float& rotacao, float& velocidade, bool& saltar) {
 	int metade = NUM_RAIOS / 2;
 
 	float direita = 0.0f;
-	for (int i = 0; i < metade; i++) 
+	for (int i = 0; i < metade; i++)
 		direita += g_flDistancias[i];
 	direita /= metade;
 
@@ -257,6 +311,14 @@ static void MoscaDecidir(float& rotacao, float& velocidade) {
 		rotacao += (esquerda >= direita) ? mosca_rotacao.GetFloat() : -mosca_rotacao.GetFloat();
 
 	velocidade = mosca_velocidade.GetFloat() * (frente / ALCANCE_RAIO);
+
+	saltar = false;
+	for (int i = 0; i <= metade + 1; i++) {
+		if (g_flDistSalto[i] < DIST_SALTAR) {
+			saltar = true;
+		}
+	}
+
 }
 
 //Tick
@@ -295,8 +357,8 @@ static void MoscaTick()
 	memset(&cmd, 0, sizeof(cmd));
 
 	/*
-	
-	O ciclo completo: sentir (raios), decidir (rotação e velocidade), agir (aplicar ao bot). 
+
+	O ciclo completo: sentir (raios), decidir (rotação e velocidade), agir (aplicar ao bot).
 	Duas vezes por segundo, escreve as 7 distâncias na consola, da esquerda para a direita.
 
 	*/
@@ -306,17 +368,23 @@ static void MoscaTick()
 		MoscaVer();
 
 		float rotacao, velocidade;
-		MoscaDecidir(rotacao, velocidade);
+		bool saltar;
+		MoscaDecidir(rotacao, velocidade, saltar);
 
 		g_flYaw += rotacao;
 		if (g_flYaw > 180.0f) g_flYaw -= 360.0f;
 		if (g_flYaw < -180.0f) g_flYaw += 360.0f;
 		cmd.forwardmove = velocidade;
 
+		if (saltar && !g_bSaltouUltimoTick)
+			cmd.buttons |= IN_JUMP;
+		g_bSaltouUltimoTick = (cmd.buttons & IN_JUMP) != 0;
+
 		if (mosca_debug.GetBool() && gpGlobals->curtime >= g_flProximoPrint) {
-			Msg("[Mosca] Esq %4.0f %4.0f %4.0f | %4.0f | %4.0f %4.0f %4.0f Dir  rot %5.2f  vel %5.1f\n",
+			Msg("[Mosca] Esq %4.0f %4.0f %4.0f | %4.0f | %4.0f %4.0f %4.0f Dir  rot %5.2f  vel %5.1f%s\n",
 				g_flDistancias[6], g_flDistancias[5], g_flDistancias[4], g_flDistancias[3],
-				g_flDistancias[2], g_flDistancias[1], g_flDistancias[0], rotacao, velocidade);
+				g_flDistancias[2], g_flDistancias[1], g_flDistancias[0], rotacao, velocidade,
+				saltar ? "  SALTO" : "");
 			g_flProximoPrint = gpGlobals->curtime + 0.5f;
 		}
 	}
@@ -347,7 +415,7 @@ public:
 	virtual void Unload(void);
 	virtual void Pause(void) {}
 	virtual void UnPause(void) {}
-	virtual const char* GetPluginDescription(void) { return "SimuladorPap - Mosca v0.2"; }
+	virtual const char* GetPluginDescription(void) { return "SimuladorPap - Mosca v0.4"; }
 	virtual void LevelInit(char const* pMapName) {}
 	virtual void ServerActivate(edict_t* pEdictList, int edictCount, int clientMax) {}
 	virtual void GameFrame(bool simulating) { if (simulating) MoscaTick(); }
