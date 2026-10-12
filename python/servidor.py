@@ -8,24 +8,32 @@ servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 servidor.bind((HOST, PORTA))
 servidor.listen(1)
-print(f"[Cerebro] A espera do corpo na porta {PORTA}...")
 
-ligacao, endereco = servidor.accept()
-print(f"[Cerebro] Liga com {endereco}")
-
-buffer = ""
 while True:
-    dados = ligacao.recv(4096)
-    if not dados:
-        print("[Cerebro] Corpo desligado")
-        break
+    print(f"[Cerebro] A espera do corpo na porta {PORTA}...")
+    ligacao, endereco = servidor.accept()
+    print(f"[Cerebro] Ligado com {endereco}")
 
-    buffer += dados.decode("utf-8")
+    buffer = ""
+    contador = 0
+    while True:
+        try:
+            dados = ligacao.recv(4096)
+        except ConnectionResetError:
+            dados = b""
 
-    while "\n" in buffer:
-        linha, buffer = buffer.split("\n", 1)
-        mensagem = json.loads(linha)
-        print(f"[Cerebro] Recebido: {mensagem}")
+        if not dados:
+            print("[Cerebro] Corpo desligado")
+            break
 
-ligacao.close()
-servidor.close()
+        buffer += dados.decode("utf-8")
+
+        while "\n" in buffer:
+            linha, buffer = buffer.split("\n", 1)
+            mensagem = json.loads(linha)
+            contador += 1
+
+            if contador % 33 == 0:
+                print(f"[Cerebro] tick {mensagem['tick']}  dist {mensagem['dist']}  salto {mensagem['salto']}")
+
+    ligacao.close()

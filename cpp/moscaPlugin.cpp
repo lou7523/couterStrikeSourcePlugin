@@ -13,6 +13,7 @@
 #include "engine/ivdebugoverlay.h"		//permite desenhar linhas no ecrã, para vermos os raios no jogo
 #include "tier2/tier2.h"
 #include "game/server/iplayerinfo.h"	//toda a informação sobre os jogadores e bots
+#include "rede.h"						//a nossa ligacao TCP com o cerebro em py
 
 #include "in_buttons.h"					//esta biblioteca tem todas as teclas que um jogador pode pressionar
 #include "tier0/memdbgon.h"				//tem de ser sempre o último include, 
@@ -61,6 +62,10 @@ const int MAX_SUBIDAS = 24;									//quantos degraus um raio pode subir no maxi
 static float g_flDistancias[NUM_RAIOS];						//este array vai guardar a distancia de cada raio 
 static bool g_bSaltouUltimoTick = false;				    //para saber se o bot saltou no tick anterior, para não saltar de novo		
 static float g_flProximoPrint = 0.0f;
+
+const int PORTA_CEREBRO = 5005;
+static float g_flProximaTentativaRede = 0.0f;
+static bool g_bEstavaLigado = false;
 static float g_flDistSalto[NUM_RAIOS];
 
 static void LimparBot()										//esquece o bot quando ele desaparece, para nunca usarmos 
@@ -313,12 +318,46 @@ static void MoscaDecidir(float& rotacao, float& velocidade, bool& saltar) {
 	velocidade = mosca_velocidade.GetFloat() * (frente / ALCANCE_RAIO);
 
 	saltar = false;
-	for (int i = 0; i <= metade + 1; i++) {
+	for (int i = metade - 1; i <= metade + 1; i++) {
 		if (g_flDistSalto[i] < DIST_SALTAR) {
 			saltar = true;
 		}
 	}
 
+}
+
+static void MoscaGerirLigacao() {
+	bool ligado = RedeLigado();
+
+	if (ligado && !g_bEstavaLigado)
+		Msg("[Mosca] Ligado ao cerebro\n");
+	if (!ligado && g_bEstavaLigado)
+		Msg("[Mosca] Ligação perdida\n");
+	g_bEstavaLigado = ligado;
+
+	if (!ligado && gpGlobals->curtime >= g_flProximaTentativaRede) {
+		RedeTentarLigar(PORTA_CEREBRO);
+		g_flProximaTentativaRede = gpGlobals->curtime + 1.0f;
+	}
+}
+
+static void MoscaEnviarSentidos() {
+	char msg[512];
+	int n = Q_snprintf(msg, sizeof(msg), "{\"tick\":%d,\"dist\":[", gpGlobals->tickcount);
+
+	for (int i = 0; i < NUM_RAIOS; i++) {
+		n += Q_snprintf(msg + n, sizeof(msg) - n, "%s%.0f", (i > 0) ? "," : "", g_flDistancias[i]);
+	}
+
+	n += Q_snprintf(msg + n, sizeof(msg) - n, "], \"salto\":[");
+
+	for (int i = 0; i < NUM_RAIOS; i++) {
+		n += Q_snprintf(msg + n, sizeof(msg) - n, "%s%.0f", (i > 0) ? "," : "", g_flDistSalto[i]);
+	}
+
+	Q_snprintf(msg + n, sizeof(msg) - n, "]}\n");
+
+	RedeEnviar(msg);
 }
 
 //Tick
@@ -337,7 +376,12 @@ static void MoscaDecidir(float& rotacao, float& velocidade, bool& saltar) {
 */
 static void MoscaTick()
 {
-	if (!g_pBotEdict || !gpGlobals)
+	if (!gpGlobals)
+		return;
+
+	MoscaGerirLigacao();
+
+	if (!g_pBotEdict)
 		return;
 
 	if (g_pBotEdict->IsFree() || !g_pBotInfo || !g_pBotInfo->IsConnected())
@@ -379,6 +423,7 @@ static void MoscaTick()
 		if (saltar && !g_bSaltouUltimoTick)
 			cmd.buttons |= IN_JUMP;
 		g_bSaltouUltimoTick = (cmd.buttons & IN_JUMP) != 0;
+		MoscaEnviarSentidos();
 
 		if (mosca_debug.GetBool() && gpGlobals->curtime >= g_flProximoPrint) {
 			Msg("[Mosca] Esq %4.0f %4.0f %4.0f | %4.0f | %4.0f %4.0f %4.0f Dir  rot %5.2f  vel %5.1f%s\n",
@@ -478,6 +523,11 @@ bool CMoscaPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn ga
 
 	gpGlobals = playerinfomanager->GetGlobalVars();
 
+	if (RedeIniciar())
+		Msg("[Mosca] Rede pronta. A procura do cerebro na porta %d...\n", PORTA_CEREBRO);
+	else
+		Warning("[Mosca] Nao consegui iniciar a rede.\n");
+
 	ConVar_Register(0);
 	Msg("[Mosca] Plugin carregado. Escreve mosca_spawn para criar o bot.\n");
 	return true;
@@ -486,6 +536,7 @@ bool CMoscaPlugin::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn ga
 void CMoscaPlugin::Unload(void)
 {
 	LimparBot();
+	RedeTerminar();
 	ConVar_Unregister();
 	DisconnectTier2Libraries();
 	DisconnectTier1Libraries();
