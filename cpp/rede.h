@@ -1,3 +1,5 @@
+bool RedeReceberLinha(char* destino, int tamanho);
+
 #ifndef REDE_H
 #define REDE_H
 

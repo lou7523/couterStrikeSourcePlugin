@@ -66,6 +66,13 @@ static float g_flProximoPrint = 0.0f;
 const int PORTA_CEREBRO = 5005;
 static float g_flProximaTentativaRede = 0.0f;
 static bool g_bEstavaLigado = false;
+
+const float TEMPO_MAX_SEM_RESPOSTA = 0.5f;
+static float g_flCmdRotacao = 0.0f;
+static float g_flCmdVelocidade = 0.0f;
+static bool g_bCmdSaltar = false;
+static float g_flUltimaResposta = -100.0f;
+
 static float g_flDistSalto[NUM_RAIOS];
 
 static void LimparBot()										//esquece o bot quando ele desaparece, para nunca usarmos 
@@ -74,6 +81,7 @@ static void LimparBot()										//esquece o bot quando ele desaparece, para nun
 	g_pBotEdict = NULL;
 	g_pBot = NULL;
 	g_pBotInfo = NULL;
+	g_flUltimaResposta = -100.0f;
 }
 
 //Variáveis da consola
@@ -83,6 +91,7 @@ static void LimparBot()										//esquece o bot quando ele desaparece, para nun
 ConVar mosca_velocidade("mosca_velocidade", "150", 0, "Velocidade para a frente do bot (0 a 250)");
 ConVar mosca_rotacao("mosca_rotacao", "5", 0, "Graus que o bot roda em cada tick");						//maximo que e preciso rodar para desviar
 ConVar mosca_debug("mosca_debug", "1", 0, "1 = desenha os raios e mostra as distancias na consola");	//liga e desliga os desenhos dos raios
+ConVar mosca_cerebro("mosca_cerebro", "1", 0, "1 = quem decide e o cerebro em python, 0 = reflexos em C++");
 
 //Comando para criar o bot
 /*
@@ -360,6 +369,20 @@ static void MoscaEnviarSentidos() {
 	RedeEnviar(msg);
 }
 
+static void MoscaReceberOrdens() {
+	char linha[256];
+	while (RedeReceberLinha(linha, sizeof(linha))) {
+		float rot, vel;
+		int saltar;
+		if (sscanf(linha, "{\"rot\": %f, \"vel\": %f, \"saltar\": %d}", &rot, &vel, &saltar) == 3) {
+			g_flCmdRotacao = rot;
+			g_flCmdVelocidade = vel;
+			g_bCmdSaltar = (saltar != 0);
+			g_flUltimaResposta = gpGlobals->curtime;
+		}
+	}
+}
+
 //Tick
 /*
 	Um servidor de cs:source funciona por ticks, ou seja, este atualiza o mundo 66 vezes por segundo
@@ -410,10 +433,30 @@ static void MoscaTick()
 	if (!g_pBotInfo->IsDead())
 	{
 		MoscaVer();
+		MoscaEnviarSentidos();
 
-		float rotacao, velocidade;
-		bool saltar;
-		MoscaDecidir(rotacao, velocidade, saltar);
+		float rotacao = 0.0f;
+		float velocidade = 0.0f;
+		bool saltar = false;
+		const char* modo;
+
+		if (mosca_cerebro.GetBool()) {
+			MoscaReceberOrdens();
+
+			if (gpGlobals->curtime - g_flUltimaResposta < TEMPO_MAX_SEM_RESPOSTA) {
+				rotacao = g_flCmdRotacao;
+				velocidade = g_flCmdVelocidade;
+				saltar = g_bCmdSaltar;
+				modo = "CEREBRO";
+			}																	
+			else {																
+				modo = "CEREBRO SEM RESPOSTA";
+			}																	
+		}																		
+		else {																	
+			MoscaDecidir(rotacao, velocidade, saltar);
+			modo = "REFLEXO C++";
+		}																		
 
 		g_flYaw += rotacao;
 		if (g_flYaw > 180.0f) g_flYaw -= 360.0f;
@@ -423,13 +466,12 @@ static void MoscaTick()
 		if (saltar && !g_bSaltouUltimoTick)
 			cmd.buttons |= IN_JUMP;
 		g_bSaltouUltimoTick = (cmd.buttons & IN_JUMP) != 0;
-		MoscaEnviarSentidos();
 
 		if (mosca_debug.GetBool() && gpGlobals->curtime >= g_flProximoPrint) {
-			Msg("[Mosca] Esq %4.0f %4.0f %4.0f | %4.0f | %4.0f %4.0f %4.0f Dir  rot %5.2f  vel %5.1f%s\n",
+			Msg("[Mosca] Esq %4.0f %4.0f %4.0f | %4.0f | %4.0f %4.0f %4.0f Dir  rot %5.2f  vel %5.1f%s [%s]\n",
 				g_flDistancias[6], g_flDistancias[5], g_flDistancias[4], g_flDistancias[3],
 				g_flDistancias[2], g_flDistancias[1], g_flDistancias[0], rotacao, velocidade,
-				saltar ? "  SALTO" : "");
+				saltar ? "  SALTO" : "", modo);
 			g_flProximoPrint = gpGlobals->curtime + 0.5f;
 		}
 	}

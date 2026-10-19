@@ -15,12 +15,16 @@ static SOCKET g_socket = INVALID_SOCKET;
 static int g_estado = DESLIGADO;
 static bool g_iniciado = false;
 
+static char g_buffer[4096];
+static int g_tamBuffer = 0;
+
 static void Fechar() {
     if (g_socket != INVALID_SOCKET) {
         closesocket(g_socket);
         g_socket = INVALID_SOCKET;
     }
     g_estado = DESLIGADO;
+    g_tamBuffer = 0;
 }
 
 bool RedeIniciar() {
@@ -95,4 +99,42 @@ bool RedeEnviar(const char* texto){
         return false;
     }
     return true;
+}
+
+bool RedeReceberLinha(char* destino, int tamanho) {
+    if (!RedeLigado())
+        return false;
+
+    int espaco = (int)sizeof(g_buffer) - g_tamBuffer;
+    if (espaco > 0) {
+		int r = recv(g_socket, g_buffer + g_tamBuffer, espaco, 0);
+        if (r > 0)
+            g_tamBuffer += r;
+        else if (r == 0) {
+            Fechar();
+            return false;
+        }
+		else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+			Fechar();
+			return false;
+		}
+    }
+
+    for (int i = 0; i < g_tamBuffer; i++) {
+        if (g_buffer[i] == '\n') {
+            int n = (i < tamanho - 1) ? i : tamanho - 1;
+			memcpy(destino, g_buffer, n);
+			destino[n] = '\0';
+
+			memmove(g_buffer, g_buffer + i + 1, g_tamBuffer - (i + 1));
+			g_tamBuffer -= i + 1;
+            return true;
+        }   
+    }
+
+	if (g_tamBuffer >= (int)sizeof(g_buffer)) {
+		g_tamBuffer = 0;
+	}
+
+    return false;
 }
