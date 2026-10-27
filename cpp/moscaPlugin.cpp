@@ -73,6 +73,20 @@ static float g_flCmdVelocidade = 0.0f;
 static bool g_bCmdSaltar = false;
 static float g_flUltimaResposta = -100.0f;
 
+const float ALTURA_OLHOS_JOGADOR = 64.0f;								//altura dos olhos do jogador, para os raios sairem de lá
+const float PAUSA_INICIO = 0.3f;
+const int FIM_NAO = 0;
+const int FIM_SAIDA = 1;				//chegou ao fim
+const int FIM_TEMPO = 2;				//ficou sem tempo
+const int FIM_INTERROMPIDO = 3;			//morreu ou foi morto
+
+static int g_iEpisodio = 0;				//numero de tentativas
+static bool g_bPrecisaReset = true;		//comeca nova tentativa proximo tick
+static float g_flInicioEpisodio = 0.0f;		//tempo em que comecou a tentativa
+static float g_flPausaAte = 0.0f;
+static Vector g_vUltimaPos;
+
+
 static float g_flDistSalto[NUM_RAIOS];
 
 static void LimparBot()										//esquece o bot quando ele desaparece, para nunca usarmos 
@@ -82,6 +96,7 @@ static void LimparBot()										//esquece o bot quando ele desaparece, para nun
 	g_pBot = NULL;
 	g_pBotInfo = NULL;
 	g_flUltimaResposta = -100.0f;
+	g_bPrecisaReset = true;
 }
 
 //Variáveis da consola
@@ -92,6 +107,11 @@ ConVar mosca_velocidade("mosca_velocidade", "150", 0, "Velocidade para a frente 
 ConVar mosca_rotacao("mosca_rotacao", "5", 0, "Graus que o bot roda em cada tick");						//maximo que e preciso rodar para desviar
 ConVar mosca_debug("mosca_debug", "1", 0, "1 = desenha os raios e mostra as distancias na consola");	//liga e desliga os desenhos dos raios
 ConVar mosca_cerebro("mosca_cerebro", "1", 0, "1 = quem decide e o cerebro em python, 0 = reflexos em C++");
+ConVar mosca_treino("mosca_treino", "0", 0, "1 = o jogo espera a resposta do cerebro a cada tick (para aprender)");
+ConVar mosca_inicio("mosca_inicio", "34.4 148.1 320.0 -89.4", 0, "Partida x y z (do getpos (olhos)) e direcao (yaw)");
+ConVar mosca_saida("mosca_saida", "924.4 -839.0 319.0", 0, "Saida: x y z (do getpos, olhos)");
+ConVar mosca_raio_saida("mosca_raio_saida", "96", 0, "A que distancia da saida conta como chegou");
+ConVar mosca_tempo_max("mosca_tempo_max", "90", 0, "Segundos (de jogo) por tentativa");
 
 //Comando para criar o bot
 /*
@@ -350,37 +370,85 @@ static void MoscaGerirLigacao() {
 	}
 }
 
-static void MoscaEnviarSentidos() {
-	char msg[512];
-	int n = Q_snprintf(msg, sizeof(msg), "{\"tick\":%d,\"dist\":[", gpGlobals->tickcount);
+static void MoscaEnviarSentidos(const Vector& pes,	float dSaida, int bateu, int fim) {
+	char msg[768];
+	int n = Q_snprintf(msg, sizeof(msg),
+		"{\"tick\":%d,\"ep\":%d,\"t\":%.2f,\"pos\":[%.0f,%.0f,%.0f],\"yaw\":%.1f,\"dsaida\":%.0f,\"bateu\":%d,\"fim\":%d,\"dist\":[",
+		gpGlobals->tickcount, g_iEpisodio, gpGlobals->curtime - g_flInicioEpisodio,
+		pes.x, pes.y, pes.z, g_flYaw, dSaida, bateu, fim);
 
-	for (int i = 0; i < NUM_RAIOS; i++) {
+	for(int i = 0; i < NUM_RAIOS; i++)
 		n += Q_snprintf(msg + n, sizeof(msg) - n, "%s%.0f", (i > 0) ? "," : "", g_flDistancias[i]);
-	}
 
-	n += Q_snprintf(msg + n, sizeof(msg) - n, "], \"salto\":[");
+	n += Q_snprintf(msg + n, sizeof(msg) - n, "],\"salto\":[");
 
-	for (int i = 0; i < NUM_RAIOS; i++) {
+	for (int i = 0; i < NUM_RAIOS; i++)
 		n += Q_snprintf(msg + n, sizeof(msg) - n, "%s%.0f", (i > 0) ? "," : "", g_flDistSalto[i]);
-	}
 
 	Q_snprintf(msg + n, sizeof(msg) - n, "]}\n");
 
 	RedeEnviar(msg);
 }
 
+static void MoscaComecarEpisodio() {
+	float x = 0, y = 0, z = 0, yaw = 0;
+	sscanf(mosca_inicio.GetString(), "%f %f %f %f", &x, &y, &z, &yaw);
+
+	Vector pos(x, y, z - ALTURA_OLHOS_JOGADOR + 2.0f);
+	g_pBot->SetAbsOrigin(pos);
+	g_flYaw = yaw;
+
+	g_iEpisodio++;
+	g_flInicioEpisodio = gpGlobals->curtime;
+	g_flPausaAte = gpGlobals->curtime + PAUSA_INICIO;
+	g_vUltimaPos = pos;
+	g_bPrecisaReset = false;
+
+	Msg("[Mosca] ---- Tentativa %d ----\n", g_iEpisodio);
+}
+
+static float MoscaDistanciaSaida(const Vector& pes, float& difAltura) {
+	float x = 0, y = 0, z = 0;
+	sscanf(mosca_saida.GetString(), "%f %f %f", &x, &y, &z);
+
+	float dx = x - pes.x;
+	float dy = y - pes.y;
+	difAltura = (z - ALTURA_OLHOS_JOGADOR) - pes.z;
+	return sqrtf(dx * dx + dy * dy);
+}
+
+static int MoscaVerificarFim(float dSaida, float difAltura) {
+	if (dSaida < mosca_raio_saida.GetFloat() && fabsf(difAltura) < 64.0f)
+		return FIM_SAIDA;
+	if (gpGlobals->curtime - g_flInicioEpisodio > mosca_tempo_max.GetFloat())
+		return FIM_TEMPO;
+	return FIM_NAO;
+}
+
+static bool MoscaLerOrdem(const char* linha) {
+	float rot, vel;
+	int salt;
+	if (sscanf(linha, "{\"rot\": %f, \"vel\": %f, \"saltar\": %d}", &rot, &vel, &salt) != 3)
+		return false;
+
+	g_flCmdRotacao = rot;
+	g_flCmdVelocidade = vel;
+	g_bCmdSaltar = (salt != 0);
+	g_flUltimaResposta = gpGlobals->curtime;
+	return true;
+}
+
 static void MoscaReceberOrdens() {
 	char linha[256];
-	while (RedeReceberLinha(linha, sizeof(linha))) {
-		float rot, vel;
-		int saltar;
-		if (sscanf(linha, "{\"rot\": %f, \"vel\": %f, \"saltar\": %d}", &rot, &vel, &saltar) == 3) {
-			g_flCmdRotacao = rot;
-			g_flCmdVelocidade = vel;
-			g_bCmdSaltar = (saltar != 0);
-			g_flUltimaResposta = gpGlobals->curtime;
-		}
+
+	if (mosca_treino.GetBool()) {
+		if (RedeEsperarLinha(linha, sizeof(linha), 200))
+			MoscaLerOrdem(linha);
+		return;
 	}
+
+	while (RedeReceberLinha(linha, sizeof(linha)))
+		MoscaLerOrdem(linha);
 }
 
 //Tick
@@ -397,8 +465,7 @@ static void MoscaReceberOrdens() {
 					  pelo MoscaDecidir). E o runPlayerMove entrega estes comandos à engine
 
 */
-static void MoscaTick()
-{
+static void MoscaTick() {
 	if (!gpGlobals)
 		return;
 
@@ -430,33 +497,72 @@ static void MoscaTick()
 
 	*/
 
-	if (!g_pBotInfo->IsDead())
-	{
-		MoscaVer();
-		MoscaEnviarSentidos();
+	if (g_pBotInfo->IsDead()) {
+		g_bPrecisaReset = true;
+	}
+	else {
+		if (g_bPrecisaReset)
+			MoscaComecarEpisodio();
 
-		float rotacao = 0.0f;
-		float velocidade = 0.0f;
-		bool saltar = false;
-		const char* modo;
+			Vector pes = g_pBot->GetLocalOrigin();
 
-		if (mosca_cerebro.GetBool()) {
-			MoscaReceberOrdens();
+			int fim = FIM_NAO;
+			if ((pes - g_vUltimaPos).Length() > 150.0f)
+				fim = FIM_INTERROMPIDO;
+			g_vUltimaPos = pes;
 
-			if (gpGlobals->curtime - g_flUltimaResposta < TEMPO_MAX_SEM_RESPOSTA) {
-				rotacao = g_flCmdRotacao;
-				velocidade = g_flCmdVelocidade;
-				saltar = g_bCmdSaltar;
-				modo = "CEREBRO";
-			}																	
-			else {																
-				modo = "CEREBRO SEM RESPOSTA";
-			}																	
-		}																		
-		else {																	
-			MoscaDecidir(rotacao, velocidade, saltar);
-			modo = "REFLEXO C++";
-		}																		
+			MoscaVer();
+			float difAltura;
+			float dSaida = MoscaDistanciaSaida(pes, difAltura);
+			int bateu = (g_flDistancias[NUM_RAIOS / 2] < 20.0f) ? 1 : 0;
+			if (fim == FIM_NAO)
+				fim = MoscaVerificarFim(dSaida, difAltura);
+
+			if (gpGlobals->curtime < g_flPausaAte && fim == FIM_NAO) {
+				cmd.viewangles = QAngle(0.0f, g_flYaw, 0.0f);
+				g_pBot->SetLocalAngles(cmd.viewangles);
+				g_pBot->RunPlayerMove(&cmd);
+				return;
+			}
+
+			MoscaEnviarSentidos(pes, dSaida, bateu, fim);
+
+			if (fim != FIM_NAO) {
+				const char* nomes[] = { "", "CHEGOU A SAIDA", "ACABOU O TEMPO", "INTERROMPIDA" };
+				Msg("[Mosca] Tentativa %d: %s em %.1f s\n", g_iEpisodio, nomes[fim], gpGlobals->curtime - g_flInicioEpisodio);
+				g_bPrecisaReset = true;
+			}
+
+			float rotacao = 0.0f;
+			float velocidade = 0.0f;
+			bool saltar = false;
+			const char* modo;
+
+			if (mosca_cerebro.GetBool()) {
+				MoscaReceberOrdens();
+				
+				if (gpGlobals->curtime - g_flUltimaResposta < TEMPO_MAX_SEM_RESPOSTA) {
+					rotacao = g_flCmdRotacao;
+					velocidade = g_flCmdVelocidade;
+					saltar = g_bCmdSaltar;
+					modo = "CEREBRO";
+				}
+				else {
+					modo = "SEM RESPOSTA";
+				}
+	}
+			else {
+				MoscaDecidir(rotacao, velocidade, saltar);
+				modo = "REFLEXOS em C++";
+			}
+
+			if (fim != FIM_NAO) {
+				rotacao = 0.0f;
+				velocidade = 0.0f;
+				saltar = false;
+			}
+
+
 
 		g_flYaw += rotacao;
 		if (g_flYaw > 180.0f) g_flYaw -= 360.0f;
@@ -502,7 +608,7 @@ public:
 	virtual void Unload(void);
 	virtual void Pause(void) {}
 	virtual void UnPause(void) {}
-	virtual const char* GetPluginDescription(void) { return "SimuladorPap - Mosca v0.4"; }
+	virtual const char* GetPluginDescription(void) { return "SimuladorPap - Mosca v0."; }
 	virtual void LevelInit(char const* pMapName) {}
 	virtual void ServerActivate(edict_t* pEdictList, int edictCount, int clientMax) {}
 	virtual void GameFrame(bool simulating) { if (simulating) MoscaTick(); }

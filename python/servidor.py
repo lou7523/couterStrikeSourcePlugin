@@ -1,5 +1,7 @@
 import socket
 import json
+import csv
+import os
 
 HOST = "127.0.0.1"
 PORTA = 5005
@@ -9,6 +11,8 @@ ALCANCE = 500.0
 DIST_SALTAR = 48.0
 ROTACAO_MAX = 5.0
 VELOCIDADE_MAX = 150.0
+FICHEIROS_RESULTADOS = "resultados.csv"
+NOMES_FIM = {1: "SAIDA", 2: "TEMPO", 3: "INTERROMPIDA"} 
 
 
 def decidir(dist, salto):
@@ -34,6 +38,13 @@ def decidir(dist, salto):
 
     return rotacao, velocidade, saltar
 
+def guardar_resultado(linha):
+    novo = not os.path.exists(FICHEIROS_RESULTADOS)
+    with open(FICHEIROS_RESULTADOS, "a", newline="") as f:
+        escritor = csv.writer(f)
+        if novo:
+            escritor.writerow(["episodio", "resultado", "tempo", "colisoes", "distancia_minima"])
+        escritor.writerow(linha)
 
 servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -47,6 +58,10 @@ while True:
 
     buffer = ""
     contador = 0
+    episodio_atual = None
+    colisoes = 0
+    distancia_minima = None
+
     while True:
         try:
             dados = ligacao.recv(4096)
@@ -63,6 +78,13 @@ while True:
             linha, buffer = buffer.split("\n", 1)
             mensagem = json.loads(linha)
             contador += 1
+            if mensagem["ep"] != episodio_atual:
+                episodio_atual = mensagem["ep"]
+                colisoes = 0
+                distancia_minima = mensagem["dsaida"]
+
+            colisoes += mensagem["bateu"]
+            distancia_minima = min(distancia_minima, mensagem["dsaida"])
 
             rotacao, velocidade, saltar = decidir(mensagem["dist"], mensagem["salto"])
 
@@ -72,7 +94,13 @@ while True:
             except (ConnectionResetError, BrokenPipeError):
                 break
 
-            if contador % 33 == 0:
-                print(f"[Cerebro] dist {mensagem['dist']}  ->  rot {rotacao:5.2f}  vel {velocidade:5.1f}  saltar {saltar}")
+            if mensagem["fim"] != 0:
+                nome = NOMES_FIM.get(mensagem["fim"], "?")
+                print(f"[Cerebro] Tentativa {episodio_atual}: {nome} em {mensagem['t']:.1f} s"
+                      f"  (colisoes: {colisoes}, mais perto da saida: {distancia_minima:.0f})")
+                guardar_resultado([episodio_atual, nome, round(mensagem["t"], 2), colisoes, distancia_minima])
 
+            if contador % 66 == 0:
+                print(f"[Cerebro] tentativa {mensagem['ep']}    t {mensagem['t']:5.1f}   "
+                      f"saida a {mensagem['dsaida']:5.0f}   rot {rotacao:5.2f}  vel {velocidade:5.1f}")
     ligacao.close() 

@@ -138,3 +138,24 @@ bool RedeReceberLinha(char* destino, int tamanho) {
 
     return false;
 }
+
+bool RedeEsperarLinha(char* destino, int tamanho, int msMax) {
+    DWORD inicio = GetTickCount();
+    while (RedeLigado()) {
+        if (RedeReceberLinha(destino, tamanho))
+            return true;
+
+        int passou = (int)(GetTickCount() - inicio);
+        if (passou >= msMax)
+            return false;
+
+        fd_set leitura;
+        FD_ZERO(&leitura);
+        FD_SET(g_socket, &leitura);
+        timeval espera;
+        espera.tv_sec = 0;
+        espera.tv_usec = (msMax - passou) * 1000;
+        select(0, &leitura, NULL, NULL, &espera);
+    }
+    return false;
+}
